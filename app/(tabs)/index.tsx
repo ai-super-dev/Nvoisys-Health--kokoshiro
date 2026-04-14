@@ -3,6 +3,7 @@ import { Link } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -15,10 +16,22 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { PatientTheme as T } from '@/constants/patient-theme';
 import { usePatientAuth } from '@/contexts/PatientAuthContext';
-import { fetchPatientAppointments, fetchPatientWounds } from '@/lib/patient/api';
+import { deletePatientWound, fetchPatientAppointments, fetchPatientWounds } from '@/lib/patient/api';
 import type { AppointmentRecord, WoundSummary } from '@/lib/patient/types';
 
 type AuthMode = 'signin' | 'register';
+
+function woundStatusLabel(raw: string) {
+  const map: Record<string, string> = {
+    review_pending: 'Review pending',
+    reviewed: 'Reviewed',
+    closed: 'Closed',
+  };
+  if (map[raw]) return map[raw];
+  return raw
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
 
 export default function PatientDashboardScreen() {
   const { ready, user, isPatient, signIn, signUpPatient, signOut } = usePatientAuth();
@@ -48,6 +61,25 @@ export default function PatientDashboardScreen() {
   useEffect(() => {
     load();
   }, [load]);
+
+  const confirmDeleteWound = (w: WoundSummary) => {
+    const preview = (w.description || 'this report').trim().slice(0, 72);
+    Alert.alert('Delete wound report', `Remove “${preview}”? This cannot be undone.`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await deletePatientWound(w.id);
+            await load();
+          } catch (e: unknown) {
+            Alert.alert('Could not delete', e instanceof Error ? e.message : 'Delete failed.');
+          }
+        },
+      },
+    ]);
+  };
 
   const onSignIn = async () => {
     setAuthError('');
@@ -261,13 +293,22 @@ export default function PatientDashboardScreen() {
           <Text style={styles.empty}>No wound reports yet.</Text>
         ) : (
           wounds.slice(0, 5).map((w) => (
-            <View key={w.id} style={styles.listItem}>
-              <Text style={styles.listTitle} numberOfLines={1}>
-                {w.description || 'Wound case'}
-              </Text>
-              <Text style={styles.listMeta}>
-                {w.status} · {w.created?.slice(0, 10) || ''}
-              </Text>
+            <View key={w.id} style={styles.woundRow}>
+              <View style={styles.woundRowBody}>
+                <Text style={styles.listTitle} numberOfLines={1}>
+                  {w.description || 'Wound case'}
+                </Text>
+                <Text style={styles.listMeta}>
+                  {woundStatusLabel(w.status)} · {w.created?.slice(0, 10) || ''}
+                </Text>
+              </View>
+              <Pressable
+                onPress={() => confirmDeleteWound(w)}
+                style={({ pressed }) => [styles.woundDelete, pressed && styles.woundDeletePressed]}
+                hitSlop={10}
+                accessibilityLabel="Delete wound report">
+                <Ionicons name="trash-outline" size={22} color={T.danger} />
+              </Pressable>
             </View>
           ))
         )}
@@ -391,6 +432,28 @@ const styles = StyleSheet.create({
     borderColor: T.border,
     ...T.shadowSoft,
   },
+  woundRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: T.bgElevated,
+    borderRadius: T.radiusMd,
+    paddingVertical: 12,
+    paddingLeft: 16,
+    paddingRight: 8,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: T.border,
+    ...T.shadowSoft,
+  },
+  woundRowBody: { flex: 1, minWidth: 0, paddingRight: 8 },
+  woundDelete: {
+    width: 44,
+    height: 44,
+    borderRadius: T.radiusSm,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  woundDeletePressed: { opacity: 0.65, backgroundColor: T.dangerMuted },
   listTitle: { fontSize: 16, fontWeight: '700', color: T.text },
   listMeta: { fontSize: 13, color: T.textSecondary, marginTop: 6, lineHeight: 18 },
 });

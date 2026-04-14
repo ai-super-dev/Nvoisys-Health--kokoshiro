@@ -10,12 +10,28 @@
  */
 
 import type { RecordModel } from 'pocketbase';
+import { ClientResponseError } from 'pocketbase';
 
 import { pb } from '@/pocketbase';
 
 import type { AppointmentRecord, DoctorListItem, WoundSummary } from './types';
 
 const DEFAULT_WOUND_MESSAGE = 'Wound report submitted. Doctor will review shortly.';
+
+function readPocketBaseDataMessages(err: ClientResponseError): string | null {
+  const data = err.response?.data as Record<string, { message?: string } | string> | undefined;
+  if (!data || typeof data !== 'object') return null;
+  const top = data.message;
+  if (typeof top === 'string' && top.trim()) return top;
+  const lines: string[] = [];
+  for (const [key, val] of Object.entries(data)) {
+    if (key === 'message') continue;
+    if (val && typeof val === 'object' && typeof val.message === 'string') {
+      lines.push(`${key}: ${val.message}`);
+    }
+  }
+  return lines.length ? lines.join('\n') : null;
+}
 
 function getAuthRecord(): RecordModel | null {
   const store = pb.authStore as { record?: RecordModel | null; model: RecordModel | null };
@@ -75,27 +91,37 @@ function mapProfileToDoctor(p: RecordModel): DoctorListItem {
   };
 }
 
+function matchesCategory(d: DoctorListItem, category: string) {
+  const c = category.trim().toLowerCase();
+  if (!c || c === 'all') return true;
+  const spec = d.specialty.trim().toLowerCase();
+  const dept = d.department.trim().toLowerCase();
+  return spec === c || dept === c || spec.includes(c) || dept.includes(c);
+}
+
 export async function fetchDoctors(params: {
   category?: string;
   search?: string;
 }): Promise<DoctorListItem[]> {
-  const category = params.category?.trim();
+  const category = params.category?.trim() ?? '';
   const search = params.search?.trim().toLowerCase();
+
+  let fromProfiles: DoctorListItem[] | null = null;
 
   try {
     const records = await pb.collection('doctor_profile').getFullList({
       expand: 'user',
       requestKey: null,
     });
-    let rows = records.map(mapProfileToDoctor).filter((d) => d.id);
+    fromProfiles = records.map(mapProfileToDoctor).filter((d) => d.id);
+  } catch {
+    fromProfiles = null;
+  }
 
+  if (fromProfiles !== null) {
+    let rows = fromProfiles;
     if (category && category !== 'All') {
-      rows = rows.filter(
-        (d) =>
-          d.specialty === category ||
-          d.department === category ||
-          d.specialty.toLowerCase().includes(category.toLowerCase()),
-      );
+      rows = rows.filter((d) => matchesCategory(d, category));
     }
     if (search) {
       rows = rows.filter(
@@ -103,16 +129,18 @@ export async function fetchDoctors(params: {
           d.name.toLowerCase().includes(search) ||
           d.specialty.toLowerCase().includes(search) ||
           d.bio.toLowerCase().includes(search) ||
-          d.email.toLowerCase().includes(search),
+          d.email.toLowerCase().includes(search) ||
+          d.department.toLowerCase().includes(search),
       );
     }
-    if (rows.length) return rows;
-  } catch {
-    /* collection missing or rules — fall through */
+    return rows;
   }
 
   const doctors = await fetchUsersByRole('doctor');
   let rows = doctors.map(mapUserToDoctor);
+  if (category && category !== 'All') {
+    rows = rows.filter((d) => matchesCategory(d, category));
+  }
   if (search) {
     rows = rows.filter(
       (d) => d.name.toLowerCase().includes(search) || d.email.toLowerCase().includes(search),
@@ -147,6 +175,33 @@ export type CreateAppointmentInput = {
   consultType: string;
   notes?: string;
 };
+
+/**
+ * Turns PocketBase API errors into text the booking UI can show.
+ * 404 usually means the `appointments` collection is missing or the URL is wrong.
+ */
+export function formatAppointmentBookingError(error: unknown): string {
+  if (!(error instanceof ClientResponseError)) {
+    return error instanceof Error ? error.message : 'Booking failed.';
+  }
+  const fromData = readPocketBaseDataMessages(error);
+  if (fromData) return fromData;
+  if (error.status === 404) {
+    return (
+      'The server could not find the "appointments" collection (HTTP 404). ' +
+      'In PocketBase Admin, create a collection named exactly `appointments` with relation fields `patient` and `doctor` ' +
+      '(both pointing at your users/auth collection), plus text fields `scheduled_at`, `slot_label`, `consult_type`, `status`, and `notes`. ' +
+      'Then set create rules so patients can insert their own rows.'
+    );
+  }
+  if (error.status === 403) {
+    return (
+      'Creating an appointment was forbidden (HTTP 403). Update PocketBase API rules on the `appointments` collection ' +
+      'so authenticated patients can create records (and relate to the chosen doctor).'
+    );
+  }
+  return error.message || 'Booking failed.';
+}
 
 export async function createAppointment(input: CreateAppointmentInput) {
   const patient = getAuthRecord();
@@ -217,7 +272,33 @@ export type SubmitWoundInput = {
   doctorUserId?: string | null;
 };
 
-export async function submitWoundReport(input: SubmitWoundInput) {
+export type SubmitWoundReportResult = {
+  woundId: string;
+  conversationId: string | null;
+  /** False when the wound row was saved but conversation / thread setup failed. */
+  threadStarted: boolean;
+};
+
+/** PocketBase errors when creating the wound row (before the conversation pipeline). */
+export function formatWoundSubmitError(error: unknown): string {
+  if (!(error instanceof ClientResponseError)) {
+    return error instanceof Error ? error.message : 'Submit failed.';
+  }
+  const fromData = readPocketBaseDataMessages(error);
+  if (fromData) return fromData;
+  if (error.status === 404) {
+    return (
+      'The server could not save to the "wounds" collection (HTTP 404). ' +
+      'Confirm the collection exists and your account is allowed to create records.'
+    );
+  }
+  if (error.status === 403) {
+    return 'Saving this wound report was forbidden (HTTP 403). Check PocketBase API rules for the `wounds` collection.';
+  }
+  return error.message || 'Submit failed.';
+}
+
+export async function submitWoundReport(input: SubmitWoundInput): Promise<SubmitWoundReportResult> {
   const patient = getAuthRecord();
   if (!patient?.id) {
     throw new Error('Sign in to submit a wound report.');
@@ -258,22 +339,77 @@ export async function submitWoundReport(input: SubmitWoundInput) {
 
   const members = uniqueIds([patient.id, ...doctorUsers.map((u) => u.id)]);
 
-  const conversation = await pb.collection('conversations').create({
-    title: buildConversationTitle(woundRecord.description as string),
-    linkedWound: woundRecord.id,
-    members,
-    lastMessageAt: new Date().toISOString(),
-  });
+  let rollbackConversationId: string | null = null;
+  try {
+    const conv = await pb.collection('conversations').create({
+      title: buildConversationTitle(woundRecord.description as string),
+      linkedWound: woundRecord.id,
+      members,
+      lastMessageAt: new Date().toISOString(),
+    });
+    rollbackConversationId = conv.id;
 
-  await pb.collection('wounds').update(woundRecord.id, {
-    conversation: conversation.id,
-  });
+    await pb.collection('wounds').update(woundRecord.id, {
+      conversation: conv.id,
+    });
 
-  await pb.collection('messages').create({
-    conversation: conversation.id,
-    kind: 'system',
-    text: DEFAULT_WOUND_MESSAGE,
-  });
+    try {
+      await pb.collection('messages').create({
+        conversation: conv.id,
+        kind: 'system',
+        text: DEFAULT_WOUND_MESSAGE,
+      });
+    } catch {
+      /* Wound + conversation are usable without the welcome message. */
+    }
 
-  return { woundId: woundRecord.id, conversationId: conversation.id };
+    return { woundId: woundRecord.id, conversationId: conv.id, threadStarted: true };
+  } catch {
+    if (rollbackConversationId) {
+      try {
+        await pb.collection('conversations').delete(rollbackConversationId);
+      } catch {
+        /* ignore rollback failure */
+      }
+    }
+    return { woundId: woundRecord.id, conversationId: null, threadStarted: false };
+  }
+}
+
+/**
+ * Deletes a wound owned by the signed-in patient. Best-effort removal of linked messages and conversation.
+ */
+export async function deletePatientWound(woundId: string): Promise<void> {
+  const patient = getAuthRecord();
+  if (!patient?.id) {
+    throw new Error('Sign in to delete a wound report.');
+  }
+  const wound = await pb.collection('wounds').getOne(woundId);
+  if ((wound.patient as string) !== patient.id) {
+    throw new Error('You can only delete your own wound reports.');
+  }
+  const convId = typeof wound.conversation === 'string' ? wound.conversation : null;
+  if (convId) {
+    try {
+      const msgs = await pb.collection('messages').getFullList({
+        filter: `conversation="${convId}"`,
+        requestKey: null,
+      });
+      for (const m of msgs) {
+        try {
+          await pb.collection('messages').delete(m.id);
+        } catch {
+          /* continue */
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      await pb.collection('conversations').delete(convId);
+    } catch {
+      /* ignore */
+    }
+  }
+  await pb.collection('wounds').delete(woundId);
 }

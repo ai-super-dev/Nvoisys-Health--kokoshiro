@@ -1,5 +1,4 @@
 import { Ionicons } from '@expo/vector-icons';
-import { ClientResponseError } from 'pocketbase';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
 import {
@@ -15,7 +14,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { PatientTheme as T } from '@/constants/patient-theme';
 import { usePatientAuth } from '@/contexts/PatientAuthContext';
-import { createAppointment, getDoctorDetail } from '@/lib/patient/api';
+import { createAppointment, formatAppointmentBookingError, getDoctorDetail } from '@/lib/patient/api';
 import type { DoctorListItem } from '@/lib/patient/types';
 
 const TIME_SLOTS = ['9:00 AM', '10:30 AM', '1:00 PM', '3:30 PM', '5:00 PM'];
@@ -74,13 +73,7 @@ export default function BookAppointmentScreen() {
         { text: 'OK', onPress: () => router.back() },
       ]);
     } catch (e) {
-      const err = e instanceof ClientResponseError;
-      const hint =
-        err && e.status === 404
-          ? 'The appointments service may not be configured yet. Contact your administrator.'
-          : e instanceof Error
-            ? e.message
-            : 'Booking failed';
+      const hint = formatAppointmentBookingError(e);
       Alert.alert('Could not book', hint);
     } finally {
       setBusy(false);

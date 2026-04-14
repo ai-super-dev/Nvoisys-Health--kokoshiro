@@ -15,7 +15,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { PatientTheme as T } from '@/constants/patient-theme';
 import { usePatientAuth } from '@/contexts/PatientAuthContext';
-import { fetchDoctors, submitWoundReport } from '@/lib/patient/api';
+import { fetchDoctors, formatWoundSubmitError, submitWoundReport } from '@/lib/patient/api';
 import type { DoctorListItem } from '@/lib/patient/types';
 
 export default function WoundCheckScreen() {
@@ -72,18 +72,24 @@ export default function WoundCheckScreen() {
     }
     setBusy(true);
     try {
-      await submitWoundReport({
+      const result = await submitWoundReport({
         description: description.trim(),
         imageUri,
         doctorUserId: doctorId,
       });
-      Alert.alert('Sent', 'Your wound report was submitted for doctor review.');
+      if (result.threadStarted) {
+        Alert.alert('Sent', 'Your wound report was submitted for doctor review.');
+      } else {
+        Alert.alert(
+          'Report saved',
+          'Your wound report was saved and appears on Home. Starting the clinical chat thread failed (server rules or missing collections). Your care team can still see the report.',
+        );
+      }
       setDescription('');
       setImageUri(null);
       setDoctorId(null);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Submit failed';
-      Alert.alert('Error', msg);
+      Alert.alert('Error', formatWoundSubmitError(e));
     } finally {
       setBusy(false);
     }
